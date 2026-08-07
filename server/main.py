@@ -7,10 +7,11 @@ from pathlib import Path
 import asyncio
 
 from jobfit.parse.resume import parse_resume
-from jobfit.engine.embed import embed_profile
+from jobfit.engine.embed import embed_profile, embed_jobs
 from jobfit.engine.rank import rank_jobs
 from jobfit.engine.judge import judge_jobs
-from jobfit.ingest.feeds import filter_jobs
+from jobfit.ingest.feeds import filter_jobs, fetch_for_roles
+from jobfit.cache.store import load_job_embeddings, save_job_embeddings
 from jobfit.config import TOP_K, MIN_FIT, EASY_APPLY_ONLY, MAX_UPLOAD_MB
 
 from server.corpus import get_corpus, start_background_refresh
@@ -18,6 +19,13 @@ from server.queue import llm_semaphore
 from server.schemas import MatchResponse, JobCardSchema
 
 app = FastAPI(title="Indeed Job Fetcher API")
+
+
+def _embed_pool(jobs):
+    """Embed an on-demand job pool, reusing cached embeddings where possible."""
+    load_job_embeddings(jobs)
+    embed_jobs(jobs)
+    save_job_embeddings(jobs)
 
 @app.on_event("startup")
 async def startup_event():
@@ -37,84 +45,109 @@ async def match_jobs(
     roles: str = Form(""),
     location: str = Form(""),
     top_k: int = Form(TOP_K),
-    min_fit: int = Form(MIN_FIT)
+    min_fit: int = Form(MIN_FIT),
+    window: str = Form("1w"),
+    seniority: str = Form("any")
 ):
-    corpus = get_corpus()
-    if not corpus:
-        raise HTTPException(status_code=503, detail="Job source not ready yet. Please try again in a few moments.")
-        
-    # Validate file size
-    resume.file.seek(0, 2)
-    file_size = resume.file.tell()
-    resume.file.seek(0)
-    if file_size > MAX_UPLOAD_MB * 1024 * 1024:
-        raise HTTPException(status_code=400, detail=f"Resume file exceeds maximum size of {MAX_UPLOAD_MB}MB")
-        
-    if not resume.filename.lower().endswith('.pdf') and not resume.filename.lower().endswith('.txt'):
-        raise HTTPException(status_code=400, detail="Only PDF and TXT files are supported")
-
-    # Process resume in temp file
-    fd, temp_path = tempfile.mkstemp(suffix=Path(resume.filename).suffix)
     try:
-        with os.fdopen(fd, 'wb') as f:
-            f.write(await resume.read())
+        corpus = get_corpus()
+        if not corpus:
+            raise HTTPException(status_code=503, detail="Job source not ready yet. Please try again in a few moments.")
             
-        # 1. Parse & Embed (Fast)
-        profile = parse_resume(temp_path)
-        embed_profile(profile)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to process resume: {str(e)}")
-    finally:
-        # Clean up resume file
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
+        # Validate file size
+        resume.file.seek(0, 2)
+        file_size = resume.file.tell()
+        resume.file.seek(0)
+        if file_size > MAX_UPLOAD_MB * 1024 * 1024:
+            raise HTTPException(status_code=400, detail=f"Resume file exceeds maximum size of {MAX_UPLOAD_MB}MB")
+            
+        if not resume.filename.lower().endswith('.pdf') and not resume.filename.lower().endswith('.txt'):
+            raise HTTPException(status_code=400, detail="Only PDF and TXT files are supported")
 
-    # 2. Filter corpus
-    role_list = [r.strip() for r in roles.split(",") if r.strip()]
-    filtered_jobs = filter_jobs(corpus, role_list, location)
-    
-    # 3. Rank
-    top_jobs = rank_jobs(profile, filtered_jobs, top_k)
-    
-    if not top_jobs:
-        return MatchResponse(count=0, corpus_size=len(filtered_jobs), results=[])
-        
-    # 4. Judge (Slow, guarded by semaphore)
-    async with llm_semaphore:
-        # jobfit engine functions are sync, so we run them in a thread block
+        # Process resume in temp file
+        fd, temp_path = tempfile.mkstemp(suffix=Path(resume.filename).suffix)
         try:
-            results = await asyncio.to_thread(judge_jobs, profile, top_jobs)
+            with os.fdopen(fd, 'wb') as f:
+                f.write(await resume.read())
+                
+            # 1. Parse & Embed (Fast)
+            profile = parse_resume(temp_path)
+            embed_profile(profile)
         except Exception as e:
-            raise HTTPException(status_code=503, detail=f"Model server error: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Failed to process resume: {str(e)}")
+        finally:
+            # Clean up resume file
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
 
-    # 5. Filter & Format
-    final_results = []
-    for r in results:
-        if r.fit_score >= min_fit:
-            if EASY_APPLY_ONLY and not r.job.easy_apply:
-                continue
-            final_results.append(
-                JobCardSchema(
-                    title=r.job.title,
-                    company=r.job.company,
-                    location=r.job.location,
-                    salary=r.job.salary,
-                    apply_url=r.job.apply_url,
-                    easy_apply=r.job.easy_apply,
-                    fit_score=r.fit_score,
-                    matched_skills=r.matched_skills,
-                    missing_skills=r.missing_skills,
-                    reason=r.reason
+        # 2. Build the candidate pool.
+        # If the user gave target roles, fetch a fresh, role-relevant pool from
+        # Adzuna so the ranking sees jobs that actually match what they want
+        # (the global corpus is a generic "software engineer" pull). Fall back
+        # to the global corpus if no roles are given or the fetch fails.
+        role_list = [r.strip() for r in roles.split(",") if r.strip()]
+        working_corpus = corpus
+        if role_list:
+            try:
+                pool = await asyncio.to_thread(
+                    fetch_for_roles, role_list, location or "united states"
                 )
-            )
+                if pool:
+                    await asyncio.to_thread(_embed_pool, pool)
+                    working_corpus = pool
+            except Exception as e:
+                print(f"Role-specific fetch failed, using global corpus: {e}")
+
+        # 3. Filter + rank
+        filtered_jobs = filter_jobs(working_corpus, role_list, location, window, seniority)
+        top_jobs = rank_jobs(profile, filtered_jobs, top_k)
+        
+        if not top_jobs:
+            return MatchResponse(count=0, corpus_size=len(filtered_jobs), results=[])
             
-    final_results.sort(key=lambda x: x.fit_score, reverse=True)
-    
-    return MatchResponse(
-        count=len(final_results),
-        corpus_size=len(filtered_jobs),
-        results=final_results
-    )
+        # 4. Judge (Slow, guarded by semaphore)
+        async with llm_semaphore:
+            # jobfit engine functions are sync, so we run them in a thread block
+            try:
+                results = await asyncio.to_thread(judge_jobs, profile, top_jobs)
+            except Exception as e:
+                raise HTTPException(status_code=503, detail=f"Model server error: {str(e)}")
+
+        # 5. Filter & Format
+        final_results = []
+        for r in results:
+            if r.fit_score >= min_fit:
+                if EASY_APPLY_ONLY and not r.job.easy_apply:
+                    continue
+                final_results.append(
+                    JobCardSchema(
+                        title=r.job.title,
+                        company=r.job.company,
+                        location=r.job.location,
+                        salary=r.job.salary,
+                        apply_url=r.job.apply_url,
+                        easy_apply=r.job.easy_apply,
+                        source=r.job.source,
+                        fit_score=r.fit_score,
+                        matched_skills=r.matched_skills,
+                        missing_skills=r.missing_skills,
+                        reason=r.reason
+                    )
+                )
+                
+        final_results.sort(key=lambda x: x.fit_score, reverse=True)
+        
+        return MatchResponse(
+            count=len(final_results),
+            corpus_size=len(filtered_jobs),
+            results=final_results
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=503, detail="Job source not ready yet. Please try again in a few moments.")
 
 # Serve Frontend
 frontend_dist = Path(__file__).parent.parent / "frontend" / "dist"

@@ -19,6 +19,8 @@ class Job:
     description: str
     apply_url: Optional[str]
     easy_apply: bool
+    source: str
+    posted_at: Optional[str] = None
     embedding: Optional[list[float]] = None
 
 @dataclass

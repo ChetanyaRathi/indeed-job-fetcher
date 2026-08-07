@@ -8,6 +8,7 @@ class JobCardSchema(BaseModel):
     salary: Optional[str]
     apply_url: Optional[str]
     easy_apply: bool
+    source: str
     fit_score: int
     matched_skills: list[str]
     missing_skills: list[str]

@@ -1,6 +1,6 @@
 import { useState, useRef } from 'react';
 
-export default function UploadForm({ onSubmit, isLoading }) {
+export default function UploadForm({ onSubmit, isLoading, seniority = 'any', onSeniorityChange }) {
   const [file, setFile] = useState(null);
   const [roles, setRoles] = useState('');
   const [location, setLocation] = useState('');
@@ -89,6 +89,29 @@ export default function UploadForm({ onSubmit, isLoading }) {
           onChange={(e) => setLocation(e.target.value)} 
           placeholder="e.g. Remote, New York, San Francisco"
         />
+      </div>
+
+      <div className="form-group">
+        <label>Experience Level</label>
+        <div className="seniority-options" style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
+          {[['any', 'All levels'], ['entry', 'Entry level'], ['mid', 'Mid level'], ['senior', 'Senior level']].map(([s, label]) => (
+            <button
+              type="button"
+              key={s}
+              onClick={() => onSeniorityChange && onSeniorityChange(s)}
+              style={{
+                padding: '0.5rem 1rem',
+                border: '1px solid var(--border-color)',
+                borderRadius: 'var(--border-radius)',
+                backgroundColor: seniority === s ? 'var(--primary-color)' : 'transparent',
+                color: seniority === s ? 'white' : 'inherit',
+                cursor: 'pointer'
+              }}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
       </div>
       
       <button type="submit" className="btn-submit" disabled={isLoading || !file}>

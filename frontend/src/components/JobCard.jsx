@@ -19,6 +19,7 @@ export default function JobCard({ job }) {
           <div>
             <span className="job-company">{company}</span>
             {location && <span className="job-location">• {location}</span>}
+            {job.source && <span className="job-source" style={{ marginLeft: '0.5rem', padding: '0.1rem 0.4rem', backgroundColor: 'var(--border-color)', borderRadius: '4px', fontSize: '0.8rem' }}>via {job.source}</span>}
           </div>
         </div>
         <div className="fit-badge">

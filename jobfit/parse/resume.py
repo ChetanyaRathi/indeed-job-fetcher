@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 from pypdf import PdfReader
 from jobfit.models import Profile
-from jobfit.llm.client import chat
+from jobfit.llm.client import chat_no_think
 
 def parse_resume(file_path: str | Path) -> Profile:
     """
@@ -27,14 +27,17 @@ def parse_resume(file_path: str | Path) -> Profile:
     if not raw_text.strip():
         raise ValueError("Resume file appears to be empty or could not be parsed.")
 
-    # Extract structured data using LLM
+    # Extract structured data using LLM.
+    # qwen3.5 is a thinking model; extraction is mechanical and needs no reasoning,
+    # so thinking is disabled (see chat_no_think). We also do NOT force json_object
+    # grammar, which makes this model emit empty content here.
     system_prompt = (
         "You are an expert technical recruiter. Your task is to extract information from a resume. "
-        "Return ONLY a valid JSON object with the following keys:\n"
+        "Return ONLY a single compact JSON object (no whitespace/newlines between keys) with the following keys:\n"
         "- \"skills\": list of strings (extract all technical and professional skills)\n"
         "- \"experience_years\": float (your best estimate of total years of professional experience)\n"
         "- \"summary\": string (a 2-3 line concise summary of the candidate's profile)\n"
-        "Do not include any prose or markdown blocks. Return only JSON."
+        "Do not include any prose, explanations, or markdown code fences. Return only compact JSON."
     )
     
     messages = [
@@ -42,16 +45,53 @@ def parse_resume(file_path: str | Path) -> Profile:
         {"role": "user", "content": f"Resume Text:\n{raw_text}"}
     ]
 
-    try:
-        response_json = chat(messages, response_format={"type": "json_object"})
-        data = json.loads(response_json)
+    def clean_json(text: str) -> str:
+        text = (text or "").strip()
+        if text.startswith("```json"):
+            text = text[7:]
+        elif text.startswith("```"):
+            text = text[3:]
+        if text.endswith("```"):
+            text = text[:-3]
         
-        return Profile(
-            raw_text=raw_text,
-            skills=data.get("skills", []),
-            experience_years=float(data.get("experience_years", 0.0)),
-            summary=data.get("summary", ""),
-            embedding=None
-        )
-    except Exception as e:
-        raise RuntimeError(f"Failed to extract structured data from resume: {e}") from e
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end != -1:
+            return text[start:end+1]
+        return text
+
+    max_retries = 1
+    response_json = ""
+    for attempt in range(max_retries + 1):
+        try:
+            # Thinking disabled so the mechanical extraction returns complete JSON
+            # instead of burning the token budget reasoning (which truncated it).
+            resp = chat_no_think(messages, max_tokens=2000)
+            message = resp.get("message", {})
+            response_json = message.get("content") or ""
+
+            # With thinking off this should be empty; log it (and done_reason) so
+            # any regression to the reasoning-eats-budget failure is diagnosable.
+            thinking = message.get("thinking") or ""
+            print(f"[resume extraction] attempt={attempt+1} done_reason={resp.get('done_reason')}")
+            print(f"[resume extraction] raw content:\n{response_json}")
+            if thinking:
+                print(f"[resume extraction] thinking field present ({len(thinking)} chars); content may be empty")
+
+            cleaned = clean_json(response_json)
+            data = json.loads(cleaned)
+            
+            return Profile(
+                raw_text=raw_text,
+                skills=data.get("skills", []),
+                experience_years=float(data.get("experience_years", 0.0)),
+                summary=data.get("summary", ""),
+                embedding=None
+            )
+        except Exception as e:
+            if attempt < max_retries:
+                continue
+            raise RuntimeError(
+                f"Failed to extract structured data from resume after {max_retries + 1} attempts. "
+                f"Last error: {e}. Raw response: {response_json!r}"
+            ) from e

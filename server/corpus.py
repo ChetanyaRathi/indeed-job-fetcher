@@ -14,7 +14,7 @@ def get_corpus() -> List[Job]:
 
 def _update_corpus_sync():
     global global_corpus
-    print("Fetching jobs from ATS boards...")
+    print("Fetching jobs from Adzuna...")
     jobs = fetch_all()
     print(f"Fetched {len(jobs)} jobs. Loading cache...")
     load_job_embeddings(jobs)
@@ -37,8 +37,13 @@ async def _refresh_loop():
             await refresh_corpus()
         except Exception as e:
             print(f"Error refreshing corpus: {e}")
-        # Sleep for configured hours
-        await asyncio.sleep(JOB_REFRESH_HOURS * 3600)
+        # If the corpus is still empty (e.g. Adzuna was down), retry soon
+        # instead of waiting the full refresh interval and staying broken.
+        if not global_corpus:
+            print("Corpus empty after refresh; retrying in 60s.")
+            await asyncio.sleep(60)
+        else:
+            await asyncio.sleep(JOB_REFRESH_HOURS * 3600)
 
 def start_background_refresh():
     global _refresh_task
